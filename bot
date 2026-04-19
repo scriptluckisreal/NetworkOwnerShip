@@ -30,8 +30,8 @@ local S = {
     clickThruInvisible = false, clickThruObstacles = false,
     windChaosActive = false, windRealismActive = false, tornadoActive = false,
     savedPos = CFrame.new(), savedPosSet = false,
-    -- NEW: Auto Kill All NPCs
-    autoKillActive = false, autoKillDescCon = nil,
+    -- Auto Kill All NPCs
+    autoKillActive = false, autoKillDescCon = nil, autoKillHeartbeatCon = nil,
     -- Connections
     cons = nil, tpcon = nil, deathcon = nil, driveCon = nil,
     drivePhysicsCon = nil, freezecon = nil,
@@ -58,6 +58,11 @@ local S = {
     controlOffsetDeep = 12, flyOrigWS = 16, freeDriveOrigWS = 16,
     WHEEL_KEYWORDS = {"wheel","tire","tyre","rim","hub","rubber","fl","fr","rl","rr","bl","br","lf","rf","lr","frontleft","frontright","rearleft","rearright","backleft","backright","leftfront","rightfront","leftrear","rightrear","leftback","rightback"}
 }
+
+-- Separate table for auto kill tracking (models we are actively trying to kill)
+-- Stored outside S so the heartbeat closure can directly reference it without table lookups
+local autoKillTracked = {}
+
 -- ================== UTILITY FUNCTIONS ==================
 local function setSimRadius(v)
     if sethiddenproperty then pcall(sethiddenproperty, LP, "SimulationRadius", v)
@@ -337,39 +342,32 @@ local function restorePlayerCamera()
 end
 
 -- ==================== AUTO KILL NPC SYSTEM ====================
--- Tries to claim network ownership of an NPC then kills it via Humanoid state (server-authoritative)
-local function tryKillNPC(model)
+--[[
+    FIX SUMMARY:
+    - Old system: tryKillNPC spawned ONE task per NPC that killed it once and returned.
+      If the game revived the NPC or set a new Humanoid, it was never killed again.
+    - New system:
+      1. autoKillTracked table holds every Model we want dead.
+      2. A Heartbeat loop continuously claims network ownership and applies Dead state
+         to every tracked NPC every frame, so revival is impossible while active.
+      3. DescendantAdded watches at FULL workspace depth (WS.DescendantAdded fires for
+         any descendant added anywhere in the hierarchy).
+      4. When a Model is added we wait one frame for its children to populate, then
+         check for a Humanoid. When a Humanoid is added we walk up to find its Model.
+      5. The heartbeat loop removes entries whose model or humanoid is gone, so the
+         table stays clean automatically.
+    - All kills go through Humanoid:ChangeState(Dead) only — NO TakeDamage, NO Health.
+    - Network ownership is claimed every heartbeat frame before applying state.
+]]
+
+-- Register a model into the kill-tracking table.
+-- Called both on initial scan and when new NPCs are detected.
+local function trackNPCForKill(model)
     if not model or not model.Parent then return end
     if PLRS:GetPlayerFromCharacter(model) then return end
     local hum = findHumanoid(model)
     if not hum then return end
-    local root = getPrimaryPart(model)
-    if not root then return end
-    if root.Anchored then return end -- skip anchored NPCs
-    task.spawn(function()
-        -- Keep retrying network ownership until it succeeds
-        local maxAttempts = 100
-        local attempt = 0
-        while attempt < maxAttempts do
-            if not model.Parent or not root.Parent then return end -- model was removed
-            attempt = attempt + 1
-            setSimRadius(math.huge)
-            pcall(function()
-                if root and root.Parent and not root.Anchored then
-                    root:SetNetworkOwner(LP)
-                end
-            end)
-            if partowner(root) then
-                -- Ownership confirmed, apply the kill
-                local h = findHumanoid(model)
-                if h and h.Parent then
-                    pcall(function() h:ChangeState(Enum.HumanoidStateType.Dead) end)
-                end
-                return
-            end
-            task.wait(0.1)
-        end
-    end)
+    autoKillTracked[model] = true
 end
 
 -- ==================== DRIVE SYSTEM ====================
@@ -427,36 +425,19 @@ local function stopAllDrive(ridepart_btn, ghostdrive_btn, freedrive_btn, freefly
     end
 end
 
---[[
-    DRIVE FIX NOTES:
-    - Removed partowner() gate on startDrive entry: ownership is acquired async so the drive starts
-      immediately and works as ownership is established, rather than silently failing.
-    - Removed ghost mode jitter system entirely: the alternating ±0.01 stud PreSimulation teleport
-      combined with the heartbeat PivotTo was causing violent per-frame conflicts.
-    - Ghost character is now moved to Y=-10000 (safely underground, out of the way) instead of
-      following the vehicle at -controlOffset, which was placing them inside/below the vehicle.
-    - Ride mode now sets HRP.CFrame directly instead of PivotTo on the full character model.
-      PivotTo moves ALL descendants absolutely and breaks joint physics each frame. Setting HRP
-      CFrame lets Motor6D joints handle the rest naturally with no jitter.
-    - drivePhysicsCon now claims network ownership EVERY PreSimulation frame and only applies
-      physics if partowner() confirms ownership, preventing the server snap-back teleporting.
-    - driveCon similarly re-claims ownership every heartbeat tick.
-]]
 local function startDrive(mode, target, ridepart_btn, ghostdrive_btn, freedrive_btn, freefly_btn)
     if S.driveMode ~= nil then stopAllDrive(ridepart_btn, ghostdrive_btn, freedrive_btn, freefly_btn) end
     if not target then return end
     local root = getPrimaryPart(target)
-    -- FIX: removed `not partowner(root)` gate — ownership is acquired asynchronously below
     if not root or root.Anchored then return end
     if mode ~= "free" and mode ~= "fly" then S.driveDisabledSeats = disableTargetSeats(target) else S.driveDisabledSeats = {} end
     S.driveMode = mode
     S.carTurnCurrent = 0
     task.defer(function() detectCarWheels(target, root) end)
 
-    -- FIX: Aggressively acquire network ownership as a background task immediately on drive start
     task.spawn(function()
         for i = 1, 80 do
-            if S.driveMode ~= mode then break end -- drive was stopped
+            if S.driveMode ~= mode then break end
             setSimRadius(math.huge)
             pcall(function()
                 if root and root.Parent and not root.Anchored then
@@ -485,14 +466,13 @@ local function startDrive(mode, target, ridepart_btn, ghostdrive_btn, freedrive_
 
     if mode == "ride" then
         if h then h.PlatformStand = true end
-        setCollision(c, false) -- prevent character colliding with vehicle
+        setCollision(c, false)
         enforceCam(root)
     elseif mode == "ghost" then
         S.driveChr = c
         if c then setCollision(c, false) end
         if h then h.PlatformStand = true end
         enforceCam(root)
-        -- FIX: NO jitter system. Ghost character is moved cleanly underground in driveCon heartbeat.
     elseif mode == "free" then
         S.freeDriveOrigWS = (h and h.WalkSpeed) or 16
         if h then h.WalkSpeed = 0 end
@@ -539,7 +519,6 @@ local function startDrive(mode, target, ridepart_btn, ghostdrive_btn, freedrive_
         enforceCam(root)
     end
 
-    -- HEARTBEAT: camera enforcement, player positioning, and ownership maintenance
     S.driveCon = RS.Heartbeat:Connect(function()
         if not S.driveMode then return end
         local t = S.currentpart or S.currentnpc
@@ -548,7 +527,6 @@ local function startDrive(mode, target, ridepart_btn, ghostdrive_btn, freedrive_
         if not r then stopAllDrive(ridepart_btn, ghostdrive_btn, freedrive_btn, freefly_btn); return end
         if r.Anchored then stopAllDrive(ridepart_btn, ghostdrive_btn, freedrive_btn, freefly_btn); return end
 
-        -- FIX: Continuously claim ownership every heartbeat tick to prevent server snap-back
         setSimRadius(math.huge)
         pcall(function() r:SetNetworkOwner(LP) end)
 
@@ -559,9 +537,6 @@ local function startDrive(mode, target, ridepart_btn, ghostdrive_btn, freedrive_
         if S.driveMode == "ride" then
             local pc = LP.Character
             local ph = pc and pc:FindFirstChildOfClass("Humanoid")
-            -- FIX: Use HRP.CFrame instead of pc:PivotTo() — PivotTo moves ALL descendants
-            -- absolutely each frame and breaks Motor6D joints, causing violent jitter.
-            -- Setting HRP CFrame lets joints propagate naturally without per-frame breakage.
             local rhrp = pc and pc:FindFirstChild("HumanoidRootPart")
             if rhrp then
                 pcall(function()
@@ -575,9 +550,6 @@ local function startDrive(mode, target, ridepart_btn, ghostdrive_btn, freedrive_
         elseif S.driveMode == "ghost" then
             local dc = S.driveChr
             if not dc or not dc.Parent then stopAllDrive(ridepart_btn, ghostdrive_btn, freedrive_btn, freefly_btn); return end
-            -- FIX: Move ghost character to a fixed underground position (Y=-10000) instead of
-            -- tracking the vehicle at -controlOffset. Tracking caused the ghost to be placed
-            -- inside/below the vehicle while jitter ran against it, teleporting the whole vehicle.
             local dchrp = dc:FindFirstChild("HumanoidRootPart")
             if dchrp then
                 pcall(function()
@@ -601,10 +573,6 @@ local function startDrive(mode, target, ridepart_btn, ghostdrive_btn, freedrive_
         end
     end)
 
-    -- PRE-SIMULATION: apply vehicle physics ONLY when we own the part
-    -- FIX: ownership is claimed here every PreSimulation frame — if server takes ownership back,
-    -- we immediately reclaim it. The `partowner()` guard prevents applying physics when we don't
-    -- own the part (which is what was causing the server to snap/teleport the vehicle back).
     S.drivePhysicsCon = RS.PreSimulation:Connect(function(dt)
         if not S.driveMode then
             if S.drivePhysicsCon then S.drivePhysicsCon:Disconnect(); S.drivePhysicsCon = nil end
@@ -615,11 +583,9 @@ local function startDrive(mode, target, ridepart_btn, ghostdrive_btn, freedrive_
         local r = getPrimaryPart(t)
         if not r or r.Anchored then return end
 
-        -- Reclaim ownership every physics step
         setSimRadius(math.huge)
         pcall(function() r:SetNetworkOwner(LP) end)
 
-        -- Only apply physics if we actually own the part this frame
         if not partowner(r) then return end
 
         if S.driveMode ~= "fly" then
@@ -811,7 +777,6 @@ local function buildGUI()
     makeScrollBtn("2d", "Stun Loop", "stunloop")
     makeScrollBtn("npcfree", "NPC Free Control", "npcfreecontrol")
     makeScrollBtn("clickselect", "Click Select Bot", "clickselect")
-    -- NEW: Auto Kill All NPCs toggle
     makeScrollBtn("autokillbtn", "Auto Kill All NPCs", "autokillnpcs")
     makeHeader("── PART ──")
     makeScrollBtn("1k", "Part Select", "partselect")
@@ -1432,39 +1397,125 @@ G["npcfree"].MouseButton1Click:Connect(function()
     end
 end)
 
--- ==================== AUTO KILL ALL NPCS ====================
+-- ==================== AUTO KILL ALL NPCS (FIXED) ====================
+--[[
+    HOW THIS WORKS:
+    1. On enable, WS:GetDescendants() does a full deep scan of the ENTIRE workspace
+       hierarchy at any depth. Every Model with a Humanoid that isn't a player gets
+       added to autoKillTracked.
+    2. WS.DescendantAdded fires for EVERY new descendant at ANY depth, no matter how
+       deeply nested. Two cases are handled:
+         a) A Model is added → we wait one frame (task.wait()) so children have time
+            to be parented, then check for a Humanoid.
+         b) A Humanoid is added to something → we walk up the ancestry to find the
+            owning Model and track it. This catches NPCs that already existed as
+            empty models and then had a Humanoid added later.
+    3. A dedicated Heartbeat connection runs EVERY FRAME while active. It:
+         a) Removes dead/gone entries from autoKillTracked automatically.
+         b) Claims SetNetworkOwner(LP) on the root part every frame.
+         c) Once partowner() confirms ownership, applies ChangeState(Dead) — this
+            replicates to the server through the network ownership mechanism.
+         d) Because it runs every frame, any game that tries to revive NPCs by
+            changing Health or calling GettingUp gets immediately overridden.
+    4. ONLY Humanoid:ChangeState(Dead) is used — no TakeDamage, no Health writes.
+]]
 G["autokillbtn"].MouseButton1Click:Connect(function()
     S.autoKillActive = not S.autoKillActive
     G["autokillbtn"].Text = S.autoKillActive and "✓ Auto Kill All NPCs" or "Auto Kill All NPCs"
+
     if S.autoKillActive then
-        -- Kill all currently existing NPCs in workspace
-        for _, model in pairs(WS:GetDescendants()) do
-            if model:IsA("Model") then
-                tryKillNPC(model)
+        -- Reset tracking table
+        autoKillTracked = {}
+
+        -- INITIAL DEEP SCAN: WS:GetDescendants() walks the ENTIRE workspace tree
+        -- at any depth, so even deeply nested NPCs (Folder/Folder/NPCModel) are found.
+        for _, desc in pairs(WS:GetDescendants()) do
+            if desc:IsA("Model") and not PLRS:GetPlayerFromCharacter(desc) then
+                if findHumanoid(desc) then
+                    autoKillTracked[desc] = true
+                end
             end
         end
-        -- Watch for any new NPC that spawns and immediately kill it
+
+        -- WATCH FOR NEW NPCs: WS.DescendantAdded fires for any new instance added
+        -- anywhere in the workspace hierarchy at any depth.
         S.autoKillDescCon = WS.DescendantAdded:Connect(function(ins)
-            -- Wait a moment for the model to be fully parented/setup
+            if not S.autoKillActive then return end
+
             if ins:IsA("Model") then
+                -- Wait one frame so the model's children (including Humanoid) are parented
+                task.wait()
+                if not S.autoKillActive then return end
+                if not ins.Parent then return end
+                if PLRS:GetPlayerFromCharacter(ins) then return end
+                if findHumanoid(ins) then
+                    autoKillTracked[ins] = true
+                end
+
+            elseif ins:IsA("Humanoid") then
+                -- A Humanoid was added to an existing or new model — find that model
+                -- by walking up the parent chain (handles deep nesting)
                 task.defer(function()
                     if not S.autoKillActive then return end
-                    tryKillNPC(ins)
-                end)
-            end
-            -- Also handle when a Humanoid is added to an existing model
-            if ins:IsA("Humanoid") then
-                task.defer(function()
-                    if not S.autoKillActive then return end
-                    local model = ins.Parent
-                    if model and model:IsA("Model") then
-                        tryKillNPC(model)
+                    local ancestor = ins.Parent
+                    while ancestor and ancestor ~= WS do
+                        if ancestor:IsA("Model") then
+                            if not PLRS:GetPlayerFromCharacter(ancestor) then
+                                autoKillTracked[ancestor] = true
+                            end
+                            break
+                        end
+                        ancestor = ancestor.Parent
                     end
                 end)
             end
         end)
+
+        -- CONTINUOUS KILL LOOP: runs every Heartbeat frame.
+        -- Claims network ownership and applies Dead state to every tracked NPC.
+        -- Because it runs every frame, NPCs can never be revived while this is active.
+        S.autoKillHeartbeatCon = RS.Heartbeat:Connect(function()
+            if not S.autoKillActive then return end
+            setSimRadius(math.huge)
+
+            for model, _ in pairs(autoKillTracked) do
+                -- Clean up entries that are no longer valid
+                if not model or not model.Parent then
+                    autoKillTracked[model] = nil
+                    continue
+                end
+
+                -- Skip if it turned into a player character somehow
+                if PLRS:GetPlayerFromCharacter(model) then
+                    autoKillTracked[model] = nil
+                    continue
+                end
+
+                local hum = findHumanoid(model)
+                if not hum or not hum.Parent then
+                    -- Humanoid is gone, remove from tracking
+                    autoKillTracked[model] = nil
+                    continue
+                end
+
+                local root = getPrimaryPart(model)
+                if not root or root.Anchored then continue end
+
+                -- Claim network ownership so our state change replicates to server
+                pcall(function() root:SetNetworkOwner(LP) end)
+
+                -- Only apply Dead state if we actually own the physics this frame
+                if partowner(root) then
+                    pcall(function() hum:ChangeState(Enum.HumanoidStateType.Dead) end)
+                end
+            end
+        end)
+
     else
+        -- Disable: stop all connections and clear the tracking table
         if S.autoKillDescCon then S.autoKillDescCon:Disconnect(); S.autoKillDescCon = nil end
+        if S.autoKillHeartbeatCon then S.autoKillHeartbeatCon:Disconnect(); S.autoKillHeartbeatCon = nil end
+        autoKillTracked = {}
     end
 end)
 
@@ -2500,6 +2551,8 @@ G["1"].AncestryChanged:Connect(function()
         for k, v in pairs(S) do
             if typeof(v) == "RBXScriptConnection" then v:Disconnect(); S[k] = nil end
         end
+        -- Also disconnect auto kill heartbeat (stored in S so already handled above)
+        autoKillTracked = {}
         if S.savedMinZoom ~= nil then
             pcall(function() if LP then LP.CameraMinZoomDistance = S.savedMinZoom; if S.savedMaxZoom then LP.CameraMaxZoomDistance = S.savedMaxZoom end end end)
         end
@@ -2509,4 +2562,4 @@ G["1"].AncestryChanged:Connect(function()
         for _, nc in pairs(S.ringNoCollisions) do pcall(function() if nc and nc.Parent then nc:Destroy() end end) end; S.ringNoCollisions = {}
     end
 end)
-print("NPC Controller V6 - Drive Fixed + Auto Kill NPCs Added")
+print("NPC Controller V6 - Auto Kill All NPCs FIXED (continuous heartbeat, full depth scan, newly spawned NPCs)")
